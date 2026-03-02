@@ -1,6 +1,8 @@
 use anyhow::Context;
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -9,13 +11,14 @@ use ratatui::{
     backend::CrosstermBackend,
     prelude::*,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::{
     fs,
     io::{self, Read, Stdout, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -35,7 +38,7 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
 
-    // No mouse capture => keeps selection + right-click menu working.
+    // No mouse capture => best chance of right-click menus working.
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -47,7 +50,11 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> anyhow::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -62,6 +69,7 @@ struct Shell {
     parser: vt100::Parser,
     rows: u16,
     cols: u16,
+
     in_alt_screen: bool,
     esc_tail: Vec<u8>,
 }
@@ -112,7 +120,7 @@ impl Shell {
             }
         });
 
-        let parser = vt100::Parser::new(rows.max(5), cols.max(10), 20_000);
+        let parser = vt100::Parser::new(rows.max(5), cols.max(10), 60_000);
 
         Ok(Self {
             master: pair.master,
@@ -153,7 +161,7 @@ impl Shell {
     }
 
     fn observe_alt_screen(&mut self, chunk: &[u8]) {
-        const KEEP: usize = 96;
+        const KEEP: usize = 128;
         self.esc_tail.extend_from_slice(chunk);
         if self.esc_tail.len() > KEEP {
             let start = self.esc_tail.len() - KEEP;
@@ -161,12 +169,15 @@ impl Shell {
         }
         let buf = self.esc_tail.as_slice();
 
+        // Enter alt-screen
         if contains_seq(buf, b"\x1b[?1049h")
             || contains_seq(buf, b"\x1b[?47h")
             || contains_seq(buf, b"\x1b[?1047h")
         {
             self.in_alt_screen = true;
         }
+
+        // Exit alt-screen
         if contains_seq(buf, b"\x1b[?1049l")
             || contains_seq(buf, b"\x1b[?47l")
             || contains_seq(buf, b"\x1b[?1047l")
@@ -274,19 +285,43 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        // HARD RULE: Ctrl+C must ALWAYS go to the shell
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.shell.send(&[0x03])?; // SIGINT
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        // Ctrl+C ALWAYS to shell
+        if key.code == KeyCode::Char('c') && ctrl && !alt {
+            self.shell.send(&[0x03])?;
             return Ok(());
         }
 
-        // Quit Hawk (nonstandard)
-        if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Quit Hawk
+        if key.code == KeyCode::Char('e') && ctrl && !alt {
             self.should_quit = true;
             return Ok(());
         }
 
-        // In fullscreen apps, do not intercept anything else
+        // Copy/Paste without colliding with typical terminal bindings:
+        // Ctrl+Alt+C => copy visible screen
+        // Ctrl+Alt+V => paste clipboard into shell
+        if ctrl && alt {
+            match key.code {
+                KeyCode::Char('c') => {
+                    let txt = self.shell.parser.screen().contents();
+                    clipboard_copy(&txt)?;
+                    return Ok(());
+                }
+                KeyCode::Char('v') => {
+                    let clip = clipboard_paste().unwrap_or_default();
+                    if !clip.is_empty() {
+                        self.shell.send(clip.as_bytes())?;
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // In fullscreen apps, don't intercept anything else
         if self.shell.in_alt_screen {
             if let Some(bytes) = key_to_bytes(&key) {
                 self.shell.send(&bytes)?;
@@ -295,7 +330,7 @@ impl App {
         }
 
         // Toggle hidden
-        if key.code == KeyCode::Char('h') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('h') && ctrl && !alt {
             self.toggle_hidden()?;
             return Ok(());
         }
@@ -352,8 +387,8 @@ fn ui(f: &mut Frame, app: &mut App) {
 
         app.shell.set_size(inner.height, inner.width);
 
-        let contents = app.shell.parser.screen().contents();
-        f.render_widget(Paragraph::new(contents), inner);
+        let shell_text = render_shell_colored(&app.shell);
+        f.render_widget(Paragraph::new(shell_text).wrap(Wrap { trim: false }), inner);
 
         let (crow, ccol) = app.shell.parser.screen().cursor_position();
         let x = inner.x.saturating_add(ccol.min(inner.width.saturating_sub(1)));
@@ -413,8 +448,8 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     app.shell.set_size(shell_inner.height, shell_inner.width);
 
-    let contents = app.shell.parser.screen().contents();
-    f.render_widget(Paragraph::new(contents), shell_inner);
+    let shell_text = render_shell_colored(&app.shell);
+    f.render_widget(Paragraph::new(shell_text).wrap(Wrap { trim: false }), shell_inner);
 
     let (crow, ccol) = app.shell.parser.screen().cursor_position();
     let x = shell_inner
@@ -426,11 +461,177 @@ fn ui(f: &mut Frame, app: &mut App) {
     f.set_cursor_position((x, y));
 
     let hidden = if app.show_hidden { "ON" } else { "OFF" };
-    let footer = format!("Ctrl+E quit | F5 refresh | Ctrl+H hidden: {}", hidden);
+    let footer = format!(
+        "Ctrl+E quit | F5 refresh | Ctrl+H hidden: {} | Ctrl+Alt+C copy | Ctrl+Alt+V paste",
+        hidden
+    );
     f.render_widget(
         Paragraph::new(footer).style(Style::default().fg(Color::LightYellow)),
         outer[3],
     );
+}
+
+/* ----------------------------- Colored shell rendering ----------------------------- */
+
+fn render_shell_colored(shell: &Shell) -> Text<'static> {
+    let screen = shell.parser.screen();
+    let rows = shell.rows as usize;
+    let cols = shell.cols as usize;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(rows);
+
+    for r in 0..rows {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut run_text = String::new();
+        let mut run_style = Style::default();
+
+        for c in 0..cols {
+            let cell_opt = screen.cell(r as u16, c as u16);
+            let (ch, style) = if let Some(cell) = cell_opt {
+                let s = cell.contents();
+                let ch = s.chars().next().unwrap_or(' ');
+
+                let mut st = Style::default()
+                    .fg(map_vt100_color(cell.fgcolor()))
+                    .bg(map_vt100_color(cell.bgcolor()));
+
+                if cell.bold() {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                if cell.underline() {
+                    st = st.add_modifier(Modifier::UNDERLINED);
+                }
+                if cell.inverse() {
+                    // swap fg/bg
+                    let fg = st.fg;
+                    let bg = st.bg;
+                    st.fg = bg;
+                    st.bg = fg;
+                }
+
+                (ch, st)
+            } else {
+                (' ', Style::default())
+            };
+
+            if run_text.is_empty() {
+                run_text.push(ch);
+                run_style = style;
+            } else if style == run_style {
+                run_text.push(ch);
+            } else {
+                spans.push(Span::styled(run_text.clone(), run_style));
+                run_text.clear();
+                run_text.push(ch);
+                run_style = style;
+            }
+        }
+
+        if !run_text.is_empty() {
+            spans.push(Span::styled(run_text.clone(), run_style));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    Text::from(lines)
+}
+
+fn map_vt100_color(c: vt100::Color) -> Color {
+    // vt100 0.15.x:
+    // Color::Default | Color::Idx(u8) | Color::Rgb(u8,u8,u8)
+    match c {
+        vt100::Color::Default => Color::Reset,
+        vt100::Color::Idx(i) => Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/* ----------------------------- Clipboard ----------------------------- */
+
+fn clipboard_copy(text: &str) -> anyhow::Result<()> {
+    if command_exists("wl-copy") {
+        let mut child = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn wl-copy")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+
+    if command_exists("xclip") {
+        let mut child = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn xclip")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+
+    if command_exists("xsel") {
+        let mut child = Command::new("xsel")
+            .args(["--clipboard", "--input"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn xsel")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+
+    anyhow::bail!("No clipboard tool found (install wl-clipboard or xclip/xsel)")
+}
+
+fn clipboard_paste() -> anyhow::Result<String> {
+    if command_exists("wl-paste") {
+        let out = Command::new("wl-paste")
+            .args(["-n"])
+            .output()
+            .context("run wl-paste")?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    if command_exists("xclip") {
+        let out = Command::new("xclip")
+            .args(["-selection", "clipboard", "-o"])
+            .output()
+            .context("run xclip")?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    if command_exists("xsel") {
+        let out = Command::new("xsel")
+            .args(["--clipboard", "--output"])
+            .output()
+            .context("run xsel")?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    anyhow::bail!("No clipboard tool found (install wl-clipboard or xclip/xsel)")
+}
+
+fn command_exists(cmd: &str) -> bool {
+    Command::new("sh")
+        .arg("-lc")
+        .arg(format!("command -v {} >/dev/null 2>&1", cmd))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /* ----------------------------- Listing ----------------------------- */
