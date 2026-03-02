@@ -1,0 +1,17 @@
+[package]
+name = "hawk"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["crossterm"] }
+
+portable-pty = "0.8"
+vt100 = "0.15"
+
+notify = "6.1"
+walkdir = "2.5"
+ignore = "0.4"
+

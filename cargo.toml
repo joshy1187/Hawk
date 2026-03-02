@@ -1,0 +1,17 @@
+[package]
+name = "hawk"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Hawk HUD: structural filesystem radar (tree+events) + embedded shell"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["crossterm"] }
+
+portable-pty = "0.8"
+vt100 = "0.15"
+
+notify = "6.1"
+ignore = "0.4"

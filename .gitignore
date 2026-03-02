@@ -1,0 +1,35 @@
+# Rust build output
+/target/
+
+# Cargo lock (optional)
+# Keep Cargo.lock if this is an application (recommended)
+# Comment the next line OUT if you want Cargo.lock tracked.
+# Cargo.lock
+
+# Backup files
+*.swp
+*.swo
+*~
+*.bak
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+
+# VSCode
+.vscode/
+
+# JetBrains
+.idea/
+
+# Rust analyzer cache
+.rust-analyzer/
+
+# Local config overrides
+.env
+.env.local
+
+# Generated config from Hawk shell injection
+.config/hawk/
