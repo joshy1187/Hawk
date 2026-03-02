@@ -25,7 +25,7 @@ Everything else behaves like a normal shell, including `Enter`, `Ctrl+C`, etc.
 
 ### Requirements
 - Rust (stable)
-- Linux terminal environment
+- Linux or MacOS terminal environment
 
 ### Build + run
 

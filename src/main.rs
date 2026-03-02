@@ -38,7 +38,7 @@ fn setup_terminal() -> anyhow::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
 
-    // No mouse capture => best chance of right-click menus working.
+    // NOTE: No mouse capture -> keeps terminal context menus usable.
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
     let backend = CrosstermBackend::new(stdout);
@@ -300,9 +300,7 @@ impl App {
             return Ok(());
         }
 
-        // Copy/Paste without colliding with typical terminal bindings:
-        // Ctrl+Alt+C => copy visible screen
-        // Ctrl+Alt+V => paste clipboard into shell
+        // Copy/Paste: Ctrl+Alt+C / Ctrl+Alt+V
         if ctrl && alt {
             match key.code {
                 KeyCode::Char('c') => {
@@ -487,6 +485,7 @@ fn render_shell_colored(shell: &Shell) -> Text<'static> {
 
         for c in 0..cols {
             let cell_opt = screen.cell(r as u16, c as u16);
+
             let (ch, style) = if let Some(cell) = cell_opt {
                 let s = cell.contents();
                 let ch = s.chars().next().unwrap_or(' ');
@@ -502,7 +501,6 @@ fn render_shell_colored(shell: &Shell) -> Text<'static> {
                     st = st.add_modifier(Modifier::UNDERLINED);
                 }
                 if cell.inverse() {
-                    // swap fg/bg
                     let fg = st.fg;
                     let bg = st.bg;
                     st.fg = bg;
@@ -538,8 +536,6 @@ fn render_shell_colored(shell: &Shell) -> Text<'static> {
 }
 
 fn map_vt100_color(c: vt100::Color) -> Color {
-    // vt100 0.15.x:
-    // Color::Default | Color::Idx(u8) | Color::Rgb(u8,u8,u8)
     match c {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(i) => Color::Indexed(i),
@@ -547,9 +543,25 @@ fn map_vt100_color(c: vt100::Color) -> Color {
     }
 }
 
-/* ----------------------------- Clipboard ----------------------------- */
+/* ----------------------------- Clipboard (cross-platform) ----------------------------- */
 
 fn clipboard_copy(text: &str) -> anyhow::Result<()> {
+    // macOS
+    if cfg!(target_os = "macos") && command_exists("pbcopy") {
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn pbcopy")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+
+    // Wayland
     if command_exists("wl-copy") {
         let mut child = Command::new("wl-copy")
             .stdin(Stdio::piped())
@@ -564,6 +576,7 @@ fn clipboard_copy(text: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // X11
     if command_exists("xclip") {
         let mut child = Command::new("xclip")
             .args(["-selection", "clipboard"])
@@ -578,7 +591,6 @@ fn clipboard_copy(text: &str) -> anyhow::Result<()> {
         let _ = child.wait();
         return Ok(());
     }
-
     if command_exists("xsel") {
         let mut child = Command::new("xsel")
             .args(["--clipboard", "--input"])
@@ -594,10 +606,37 @@ fn clipboard_copy(text: &str) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!("No clipboard tool found (install wl-clipboard or xclip/xsel)")
+    // Windows/WSL best-effort
+    if command_exists("powershell.exe") {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Set-Clipboard"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn powershell Set-Clipboard")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let _ = child.wait();
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "No clipboard tool found (macOS: pbcopy/pbpaste; Wayland: wl-clipboard; X11: xclip/xsel)"
+    )
 }
 
 fn clipboard_paste() -> anyhow::Result<String> {
+    // macOS
+    if cfg!(target_os = "macos") && command_exists("pbpaste") {
+        let out = Command::new("pbpaste")
+            .output()
+            .context("run pbpaste")?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    // Wayland
     if command_exists("wl-paste") {
         let out = Command::new("wl-paste")
             .args(["-n"])
@@ -606,6 +645,7 @@ fn clipboard_paste() -> anyhow::Result<String> {
         return Ok(String::from_utf8_lossy(&out.stdout).to_string());
     }
 
+    // X11
     if command_exists("xclip") {
         let out = Command::new("xclip")
             .args(["-selection", "clipboard", "-o"])
@@ -613,7 +653,6 @@ fn clipboard_paste() -> anyhow::Result<String> {
             .context("run xclip")?;
         return Ok(String::from_utf8_lossy(&out.stdout).to_string());
     }
-
     if command_exists("xsel") {
         let out = Command::new("xsel")
             .args(["--clipboard", "--output"])
@@ -622,7 +661,18 @@ fn clipboard_paste() -> anyhow::Result<String> {
         return Ok(String::from_utf8_lossy(&out.stdout).to_string());
     }
 
-    anyhow::bail!("No clipboard tool found (install wl-clipboard or xclip/xsel)")
+    // Windows/WSL best-effort
+    if command_exists("powershell.exe") {
+        let out = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Get-Clipboard"])
+            .output()
+            .context("run powershell Get-Clipboard")?;
+        return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+    }
+
+    anyhow::bail!(
+        "No clipboard tool found (macOS: pbcopy/pbpaste; Wayland: wl-clipboard; X11: xclip/xsel)"
+    )
 }
 
 fn command_exists(cmd: &str) -> bool {
@@ -634,7 +684,7 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/* ----------------------------- Listing ----------------------------- */
+/* ----------------------------- Directory listing ----------------------------- */
 
 fn read_dir_items(dir: &Path, show_hidden: bool) -> anyhow::Result<Vec<Entry>> {
     let mut out = Vec::new();
@@ -760,10 +810,7 @@ fn last_osc7_path(bytes: &[u8]) -> Option<PathBuf> {
     let mut i = 0usize;
 
     while i + 4 < bytes.len() {
-        if bytes[i] == 0x1b
-            && bytes[i + 1] == b']'
-            && bytes[i + 2] == b'7'
-            && bytes[i + 3] == b';'
+        if bytes[i] == 0x1b && bytes[i + 1] == b']' && bytes[i + 2] == b'7' && bytes[i + 3] == b';'
         {
             let start = i + 4;
 
